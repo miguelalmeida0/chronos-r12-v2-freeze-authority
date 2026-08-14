@@ -42,9 +42,14 @@ jobs:
         run: |
           set -euo pipefail
           gzip -dc inputs/chronos-v2-f866791b-linux-arm64.tar.gz | docker load
-          test "$(docker image inspect "$IMAGE_TAG" --format '{{.Id}}')" = "$IMAGE_ID"
-          test "$(docker image inspect "$IMAGE_TAG" --format '{{.Architecture}}')" = "arm64"
-          test "$(docker image inspect "$IMAGE_TAG" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_COMMIT"
+          ACTUAL_ID="$(docker image inspect "$IMAGE_TAG" --format '{{.Id}}')"
+          ACTUAL_ARCH="$(docker image inspect "$IMAGE_TAG" --format '{{.Architecture}}')"
+          ACTUAL_LABEL="$(docker image inspect "$IMAGE_TAG" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')"
+          jq -n --arg id "$ACTUAL_ID" --arg arch "$ACTUAL_ARCH" --arg label "$ACTUAL_LABEL" \
+            '{loaded_image_id:$id,architecture:$arch,revision_label:$label}' | tee output/loaded-image.json
+          test "$ACTUAL_ID" = "$IMAGE_ID"
+          test "$ACTUAL_ARCH" = "arm64"
+          test "$ACTUAL_LABEL" = "$SOURCE_COMMIT"
           gzip -dc inputs/source-f866791b.tar.gz | tar -xf - -C candidate
           mkdir -p candidate/scripts candidate/tests/aegis/benchmark
           cp inputs/audit_r12_semantic_development_gate.py candidate/scripts/
