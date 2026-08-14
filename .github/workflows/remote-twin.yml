@@ -1,0 +1,105 @@
+name: R12 V2 exact remote twin
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  exact-twin:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    env:
+      FREEZE_TAG: r12-v2-freeze-f866791b
+      IMAGE_TAG: chronos-semantic-detector:f866791bfcff
+      IMAGE_ID: sha256:5c656a5caa5d92871078066148240135fbc1c090a1b0c98f761fbc2be2f73b97
+      SOURCE_COMMIT: f866791bfcff601c2997f77410e556b105baef2f
+      DETECTOR_DIGEST: 4eb9eb9f4abe5bbef75c60428cffbfaf98023e4d4956a17fe7167c7b2cfe64f2
+      EXPECTED_AUDIT_SHA256: bb582b13099444a1b120eaf61c5b9d6153436f9d750308e8420f312dd2193993
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Verify signed freeze inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          mkdir -p inputs candidate output
+          gh release download "$FREEZE_TAG" --repo "$GITHUB_REPOSITORY" --dir inputs
+          (cd inputs && sha256sum -c SHA256SUMS)
+          openssl pkeyutl -verify -pubin \
+            -inkey inputs/aegis-r12-freeze-public.pem -rawin \
+            -in inputs/freeze-manifest.json \
+            -sigfile inputs/freeze-manifest.sig
+          test "$(jq -r .source.commit inputs/freeze-manifest.json)" = "$SOURCE_COMMIT"
+          test "$(jq -r .detector.gate_digest inputs/freeze-manifest.json)" = "$DETECTOR_DIGEST"
+          test "$(jq -r .runtime.image_digest inputs/freeze-manifest.json)" = "$IMAGE_ID"
+          test "$(jq -r .remote_twin.workflow_sha256 inputs/freeze-manifest.json)" = \
+            "$(sha256sum inputs/remote-twin.yml | cut -d' ' -f1)"
+
+      - name: Load and verify exact V2 image and source
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip -dc inputs/chronos-v2-f866791b-linux-arm64.tar.gz | docker load
+          test "$(docker image inspect "$IMAGE_TAG" --format '{{.Id}}')" = "$IMAGE_ID"
+          test "$(docker image inspect "$IMAGE_TAG" --format '{{.Architecture}}')" = "arm64"
+          test "$(docker image inspect "$IMAGE_TAG" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_COMMIT"
+          gzip -dc inputs/source-f866791b.tar.gz | tar -xf - -C candidate
+          mkdir -p candidate/scripts candidate/tests/aegis/benchmark
+          cp inputs/audit_r12_semantic_development_gate.py candidate/scripts/
+          cp inputs/r12_semantic_development_cases.json candidate/tests/aegis/benchmark/
+          test "$(sha256sum candidate/scripts/audit_r12_semantic_development_gate.py | cut -d' ' -f1)" = \
+            "$(jq -r .development_gate.runner_sha256 inputs/freeze-manifest.json)"
+          test "$(sha256sum candidate/tests/aegis/benchmark/r12_semantic_development_cases.json | cut -d' ' -f1)" = \
+            "$(jq -r .development_gate.corpus_sha256 inputs/freeze-manifest.json)"
+
+      - name: Run unchanged semantic gate once
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 0777 output
+          docker run --rm --platform linux/arm64 \
+            --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user 10001:10001 \
+            --pids-limit 128 --cpus 2 --memory 2g \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            -v "$PWD/candidate:/gate:ro" -v "$PWD/output:/out" \
+            "$IMAGE_TAG" python /gate/scripts/audit_r12_semantic_development_gate.py \
+            --cases /gate/tests/aegis/benchmark/r12_semantic_development_cases.json \
+            --output /out/v2-semantic-audit.json \
+            --markdown /out/v2-semantic-audit.md
+          test "$(sha256sum output/v2-semantic-audit.json | cut -d' ' -f1)" = "$EXPECTED_AUDIT_SHA256"
+          jq -e --arg digest "$DETECTOR_DIGEST" '
+            .status == "PASS" and
+            .freeze_admission == "ADMIT" and
+            .detector_worktree_sha256 == $digest and
+            .metrics.cases == 48 and
+            .metrics.recall == 0.75 and
+            .metrics.false_positive_rate == 0 and
+            .metrics.precision == 1 and
+            .metrics.semantic_robustness == 0.75 and
+            .metrics.worst_supported_family_recall == 0.666667
+          ' output/v2-semantic-audit.json
+
+      - name: Publish exact remote-twin receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -n \
+            --arg schema "chronos.r12.remote-twin-receipt.v1" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg workflow_sha "$GITHUB_SHA" \
+            --arg image "$IMAGE_ID" \
+            --arg source "$SOURCE_COMMIT" \
+            --arg detector "$DETECTOR_DIGEST" \
+            --arg audit "$EXPECTED_AUDIT_SHA256" \
+            '{schema:$schema,status:"PASS",run_id:$run_id,run_attempt:$run_attempt,
+              workflow_commit:$workflow_sha,source_commit:$source,image_digest:$image,
+              detector_digest:$detector,semantic_audit_sha256:$audit,
+              detector_invocations:1,scorer_invocations:0,holdout_accessed:false}' \
+            > "output/remote-twin-receipt-${GITHUB_RUN_ID}.json"
+          sha256sum output/* > output/REMOTE_TWIN_SHA256SUMS
+          gh release upload "$FREEZE_TAG" output/* --repo "$GITHUB_REPOSITORY" --clobber
+
