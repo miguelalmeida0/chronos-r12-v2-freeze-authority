@@ -102,4 +102,3 @@ jobs:
             > "output/remote-twin-receipt-${GITHUB_RUN_ID}.json"
           sha256sum output/* > output/REMOTE_TWIN_SHA256SUMS
           gh release upload "$FREEZE_TAG" output/* --repo "$GITHUB_REPOSITORY" --clobber
-
